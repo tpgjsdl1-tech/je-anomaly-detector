@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from datetime import date
@@ -78,22 +79,24 @@ def won_short(v: float) -> str:
     return f"{v / 1e8:,.1f}억원" if v >= 1e8 else f"{v / 1e4:,.0f}만원"
 
 
-# ── ① 원장 불러오기 ─────────────────────────────────────────────
+# ── ① 원장 불러오기 (여러 파일 가능) ─────────────────────────────
 with st.sidebar:
     st.header("① 원장 불러오기")
-    uploaded = st.file_uploader(
-        "총계정원장 (엑셀 또는 CSV)", type=["xlsx", "xlsm", "csv"],
-        help="ERP에서 내려받은 원장을 그대로 올리세요. 위쪽 제목 줄은 건너뛰고, 열 이름은 다음 화면에서 맞춥니다.")
-    sample_choice = NO_SAMPLE
-    if uploaded is None and SAMPLES:
-        sample_choice = st.selectbox("또는 가상 샘플 원장으로 체험", [NO_SAMPLE, *SAMPLES], key="sample_choice")
+    uploads = st.file_uploader(
+        "총계정원장 (엑셀 또는 CSV, 여러 개 가능)", type=["xlsx", "xlsm", "csv"], accept_multiple_files=True,
+        help="ERP에서 내려받은 원장을 그대로 올리세요. 여러 파일을 올리면 화면 위쪽 탭으로 번갈아 볼 수 있습니다. "
+             "위쪽 제목 줄은 건너뛰고, 열 이름은 다음 화면에서 맞춥니다.")
+    if SAMPLES:
+        st.multiselect("가상 샘플 원장 추가", list(SAMPLES), key="sample_choice", placeholder="선택 안 함")
 
 st.title("🔎 회계전표 이상징후 탐지 보조 툴")
 st.caption("Journal Entry Testing Assistant · 감사기준서 240 '경영진의 통제 무력화' 위험에 대응하는 분개 테스트를 돕습니다")
 
 
 def _pick_sample(name: str) -> None:
-    st.session_state["sample_choice"] = name
+    picked = st.session_state.get("sample_choice") or []
+    if name not in picked:
+        st.session_state["sample_choice"] = [*picked, name]
 
 
 def landing_page() -> None:
@@ -137,15 +140,70 @@ def landing_page() -> None:
                    "공개 웹에 배포한 경우에는 실제 고객사 원장을 올리지 마세요.")
 
 
-if uploaded is not None:
-    raw, source_name = uploaded.getvalue(), uploaded.name
-elif sample_choice in SAMPLES:
-    path = SAMPLES[sample_choice]
-    raw, source_name = path.read_bytes(), path.name
-    st.info(f"가상 샘플 원장으로 보는 중입니다: **{sample_choice}**. 실제 원장은 왼쪽에서 올리세요.")
-else:
+# 열린 파일 목록: 화면 이름 → (내용, 파일명, 샘플 여부)
+sources: dict[str, tuple[bytes, str, bool]] = {}
+for f in uploads or []:
+    label, n = f.name, 2
+    while label in sources:  # 같은 이름의 파일을 두 번 올린 경우
+        label, n = f"{f.name} ({n})", n + 1
+    sources[label] = (f.getvalue(), f.name, False)
+for name in st.session_state.get("sample_choice") or []:
+    if name in SAMPLES:
+        sources[name] = (SAMPLES[name].read_bytes(), SAMPLES[name].name, True)
+
+if not sources:
     landing_page()
     st.stop()
+
+
+# ── 파일 탭: 여러 원장을 위쪽에서 번갈아 보기 ───────────────────────
+# 화면에 안 보이는 위젯의 값은 Streamlit이 지우므로, 파일별 위젯 키를 'fid::이름'으로 만들고
+# 다른 파일을 보는 동안에도 그 값들을 다시 저장해 둔다 (열 연결·필터가 파일마다 유지됨).
+SEP = "::"
+
+
+def file_id(label: str) -> str:
+    return hashlib.md5(f"{label}|{len(sources[label][0])}".encode()).hexdigest()[:8]
+
+
+def _keep_active() -> None:  # 이미 선택된 탭을 다시 눌러 선택이 풀리는 것 방지
+    if st.session_state.get("active_file") is None:
+        st.session_state["active_file"] = st.session_state.get("_last_active")
+
+
+labels = list(sources)
+known = st.session_state.get("_known_files", [])
+added = [lb for lb in labels if lb not in known]
+if added:  # 새로 올린 파일이 있으면 그 파일을 바로 보여 준다
+    st.session_state["active_file"] = added[-1]
+elif st.session_state.get("active_file") not in labels:
+    last = st.session_state.get("_last_active")
+    st.session_state["active_file"] = last if last in labels else labels[0]
+st.session_state["_known_files"] = labels
+
+if len(labels) > 1:
+    st.segmented_control(
+        "원장 파일", labels, key="active_file", on_change=_keep_active, label_visibility="collapsed",
+        format_func=lambda lb: ("🧪 " if sources[lb][2] else "📄 ") + lb)
+    st.caption(f"원장 {len(labels)}개 · 탭을 눌러 전환합니다. 열 연결·필터는 파일마다 따로 기억됩니다. "
+               "탐지 규칙과 임계값(사이드바)은 모든 파일에 같이 적용됩니다.")
+active = st.session_state["active_file"]
+st.session_state["_last_active"] = active
+fid = file_id(active)
+
+live_ids = {file_id(lb) for lb in labels}
+for k in list(st.session_state.keys()):
+    if not isinstance(k, str) or SEP not in k:
+        continue
+    owner = k.split(SEP, 1)[0]
+    if owner not in live_ids:
+        del st.session_state[k]  # 닫은 파일의 값 정리
+    elif owner != fid:
+        st.session_state[k] = st.session_state[k]  # 지금 안 보이는 파일의 값 보존
+
+raw, source_name, is_sample = sources[active]
+if is_sample:
+    st.info(f"가상 샘플 원장으로 보는 중입니다: **{active}**. 실제 원장은 왼쪽에서 올리세요.")
 
 # 엑셀이면 시트 선택
 sheet = 0
@@ -156,7 +214,7 @@ if is_excel(source_name):
         st.error(f"엑셀 파일을 열 수 없습니다: {e}")
         st.stop()
     if len(sheets) > 1:
-        sheet = st.sidebar.selectbox("시트", sheets)
+        sheet = st.sidebar.selectbox(f"시트 ({active})", sheets, key=f"{fid}{SEP}sheet")
 
 try:
     raw_table = load_raw(raw, source_name, sheet)
@@ -168,14 +226,14 @@ if raw_table.empty:
     st.stop()
 
 # ── 열 연결 (매핑) ──────────────────────────────────────────────
-file_key = f"{source_name}|{sheet}|{len(raw)}"
+file_key = f"{fid}{SEP}{sheet}"
 auto_header = detect_header_row(raw_table)
 auto_mapping = suggest_mapping(with_header(raw_table, auto_header).columns)
 needs_attention = bool(missing_required(auto_mapping)) or any(v != k for k, v in auto_mapping.items())
 
 with st.expander("🔗 열 연결 — 원장의 열을 표준 항목에 맞추기", expanded=needs_attention):
     header_row = st.number_input(
-        "머리글(열 이름)이 있는 줄", 1, min(30, len(raw_table)), auto_header + 1, key=f"hdr_{file_key}",
+        "머리글(열 이름)이 있는 줄", 1, min(30, len(raw_table)), auto_header + 1, key=f"{file_key}{SEP}hdr",
         help=f"자동 감지: {auto_header + 1}번째 줄. 위쪽 제목·회사명 줄은 이 줄 위에 있으면 무시됩니다.") - 1
     table = with_header(raw_table, header_row)
     suggested = suggest_mapping(table.columns) if header_row != auto_header else auto_mapping
@@ -188,7 +246,7 @@ with st.expander("🔗 열 연결 — 원장의 열을 표준 항목에 맞추�
         choice = cols[i % 5].selectbox(
             std + (f" ({OPTIONAL_NOTE[std]})" if std in OPTIONAL_NOTE else " *"),
             options, index=options.index(default) if default in options else 0,
-            key=f"map_{std}_{file_key}_{header_row}")
+            key=f"{file_key}{SEP}map_{std}_{header_row}")
         mapping[std] = None if choice == NONE else choice
     st.caption("* 필수 · 자동으로 맞춘 결과를 확인하고, 틀린 항목만 바꾸세요. 미리보기는 원본 첫 5줄입니다.")
     st.dataframe(table.head(5), hide_index=True, use_container_width=True)
@@ -286,7 +344,7 @@ c4.metric("의심 금액 합계", won_short(view["금액"].sum()))
 st.download_button(
     "📥 엑셀 보고서 다운로드 (요약 · 의심전표 · 규칙별결과 · 분개라인)",
     data=excel_report(gl, view_results, view, source_name),
-    file_name=f"회계전표_이상징후_탐지결과_{date.today():%Y%m%d}.xlsx",
+    file_name=f"회계전표_이상징후_탐지결과_{Path(source_name).stem}_{date.today():%Y%m%d}.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     type="primary",
 )
@@ -296,7 +354,10 @@ tab_list, tab_rules, tab_benford, tab_gl = st.tabs(["🚩 의심 전표", "📊 
 # ── 탭 1: 위험도 순 의심 전표 ────────────────────────────────────
 with tab_list:
     rule_names = [RULES_BY_ID[r].name for r in selected]
-    pick = st.multiselect("규칙으로 거르기", rule_names, placeholder="전체 규칙")
+    pick_key = f"{fid}{SEP}pick"
+    if pick_key in st.session_state:  # 규칙을 끈 뒤 남은 선택값 정리
+        st.session_state[pick_key] = [p for p in st.session_state[pick_key] if p in rule_names]
+    pick = st.multiselect("규칙으로 거르기", rule_names, placeholder="전체 규칙", key=pick_key)
     shown = view
     if pick:
         shown = view[view["탐지규칙"].apply(lambda s: any(p in s.split(", ") for p in pick))]
@@ -310,7 +371,7 @@ with tab_list:
         height=420,
         on_select="rerun",
         selection_mode="single-row",
-        key="suspects",
+        key=f"suspects_{fid}",
         column_config={
             "위험도": st.column_config.ProgressColumn("위험도", min_value=0, max_value=100, format="%.0f"),
             "전표일자": st.column_config.DateColumn("전표일자", format="YYYY-MM-DD"),
@@ -382,7 +443,10 @@ with tab_benford:
     st.caption("첫 두 자리(10~99) 분포를 벤포드 기대값과 비교합니다. 부가세·원천세 등 파생 금액과 반복 금액은 제외합니다.")
     blines = benford_lines(gl)
     groups = ["전체"] + sorted(blines["작성자"].unique())
-    who = st.selectbox("작성자", groups)
+    who_key = f"{fid}{SEP}who"
+    if st.session_state.get(who_key) not in (None, *groups):
+        del st.session_state[who_key]
+    who = st.selectbox("작성자", groups, key=who_key)
     target = blines if who == "전체" else blines[blines["작성자"] == who]
     amounts = target.drop_duplicates("금액")["금액"]
     tbl = benford_table(amounts).reset_index()
@@ -407,7 +471,7 @@ with tab_benford:
 
 # ── 탭 4: 원장 ─────────────────────────────────────────────────
 with tab_gl:
-    q = st.text_input("전표번호 · 적요 · 거래처 검색")
+    q = st.text_input("전표번호 · 적요 · 거래처 검색", key=f"{fid}{SEP}q")
     show = gl[GL_COLUMNS]
     if q:
         mask = (show["전표번호"].str.contains(q, regex=False) | show["적요"].str.contains(q, regex=False)
